@@ -1,0 +1,22 @@
+# Build output
+/build/
+out/
+*.class
+*.jar
+*.war
+*.ear
+hs_err_pid*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
