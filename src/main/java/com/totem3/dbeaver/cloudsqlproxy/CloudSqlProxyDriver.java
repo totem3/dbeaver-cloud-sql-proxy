@@ -28,8 +28,10 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -63,6 +65,9 @@ public final class CloudSqlProxyDriver implements Driver {
             PROP_READY_TIMEOUT_MS,
             PROP_DELEGATE_DRIVER
     ));
+
+    private static final Object PROXY_LOCK = new Object();
+    private static final Map<ProxyKey, SharedProxy> SHARED_PROXIES = new HashMap<>();
 
     static {
         try {
@@ -110,10 +115,7 @@ public final class CloudSqlProxyDriver implements Driver {
                 DEFAULT_DELEGATE_DRIVER
         );
 
-        int port = parsePort(proxyPortRaw);
-        if (port <= 0) {
-            port = allocatePort();
-        }
+        int requestedPort = parsePort(proxyPortRaw);
 
         addQueryParamsToProperties(parsed.queryParams, delegateProps);
 
@@ -131,13 +133,13 @@ public final class CloudSqlProxyDriver implements Driver {
             connectHost = DEFAULT_PROXY_HOST;
         }
         String bindHost = isBlank(proxyHost) ? null : proxyHost;
-        String delegateUrl = buildDelegateUrl(connectHost, port, database);
 
         ensureDriverLoaded(delegateDriver);
 
-        ProxyProcess proxy = null;
+        ProxyLease proxy = null;
         try {
-            proxy = startProxy(proxyBinary, proxyArgs, bindHost, connectHost, port, instanceConnectionName, readyTimeoutMs);
+            proxy = acquireProxy(proxyBinary, proxyArgs, bindHost, connectHost, requestedPort, instanceConnectionName, readyTimeoutMs);
+            String delegateUrl = buildDelegateUrl(connectHost, proxy.getPort(), database);
             Connection delegate = DriverManager.getConnection(delegateUrl, delegateProps);
             return ProxyConnection.wrap(delegate, proxy);
         } catch (SQLException e) {
@@ -353,6 +355,60 @@ public final class CloudSqlProxyDriver implements Driver {
         }
     }
 
+    private static ProxyLease acquireProxy(String binary, String args, String bindHost, String connectHost, int requestedPort, String instanceName, int timeoutMs) throws SQLException {
+        ProxyKey key = new ProxyKey(
+                normalizeKeyPart(instanceName),
+                normalizeKeyPart(binary),
+                normalizeKeyPart(args),
+                normalizeKeyPart(bindHost),
+                requestedPort
+        );
+        synchronized (PROXY_LOCK) {
+            SharedProxy shared = SHARED_PROXIES.get(key);
+            if (shared != null) {
+                if (shared.process.isAlive()) {
+                    shared.refCount++;
+                    return new ProxyLease(shared);
+                }
+                SHARED_PROXIES.remove(key);
+            }
+
+            int port = requestedPort;
+            if (port <= 0) {
+                port = allocatePort();
+            }
+
+            ProxyProcess process = startProxy(binary, args, bindHost, connectHost, port, instanceName, timeoutMs);
+            SharedProxy created = new SharedProxy(key, process, port);
+            created.refCount = 1;
+            SHARED_PROXIES.put(key, created);
+            return new ProxyLease(created);
+        }
+    }
+
+    private static void releaseProxy(SharedProxy shared) {
+        synchronized (PROXY_LOCK) {
+            if (shared.closed) {
+                return;
+            }
+            shared.refCount--;
+            if (shared.refCount <= 0) {
+                shared.closed = true;
+                if (SHARED_PROXIES.get(shared.key) == shared) {
+                    SHARED_PROXIES.remove(shared.key);
+                }
+                shared.process.close();
+            }
+        }
+    }
+
+    private static String normalizeKeyPart(String value) {
+        if (isBlank(value)) {
+            return null;
+        }
+        return value.trim();
+    }
+
     private static ProxyProcess startProxy(String binary, String args, String bindHost, String connectHost, int port, String instanceName, int timeoutMs) throws SQLException {
         List<String> command = new ArrayList<>();
         command.add(binary);
@@ -537,6 +593,10 @@ public final class CloudSqlProxyDriver implements Driver {
             this.logThread = logThread;
         }
 
+        private boolean isAlive() {
+            return process != null && process.isAlive();
+        }
+
         private void close() {
             if (!closed.compareAndSet(false, true)) {
                 return;
@@ -557,16 +617,16 @@ public final class CloudSqlProxyDriver implements Driver {
 
     private static final class ProxyConnection implements InvocationHandler {
         private final Connection delegate;
-        private final ProxyProcess proxyProcess;
+        private final ProxyLease proxyLease;
         private final AtomicBoolean closed = new AtomicBoolean(false);
 
-        private ProxyConnection(Connection delegate, ProxyProcess proxyProcess) {
+        private ProxyConnection(Connection delegate, ProxyLease proxyLease) {
             this.delegate = delegate;
-            this.proxyProcess = proxyProcess;
+            this.proxyLease = proxyLease;
         }
 
-        private static Connection wrap(Connection delegate, ProxyProcess proxyProcess) {
-            ProxyConnection handler = new ProxyConnection(delegate, proxyProcess);
+        private static Connection wrap(Connection delegate, ProxyLease proxyLease) {
+            ProxyConnection handler = new ProxyConnection(delegate, proxyLease);
             return (Connection) Proxy.newProxyInstance(
                     CloudSqlProxyDriver.class.getClassLoader(),
                     new Class[]{Connection.class},
@@ -579,6 +639,9 @@ public final class CloudSqlProxyDriver implements Driver {
             String name = method.getName();
             if ("close".equals(name)) {
                 return handleClose();
+            }
+            if ("abort".equals(name)) {
+                return handleAbort(args);
             }
             if ("isWrapperFor".equals(name)) {
                 Class<?> iface = (Class<?>) args[0];
@@ -608,12 +671,105 @@ public final class CloudSqlProxyDriver implements Driver {
             } catch (SQLException e) {
                 thrown = e;
             } finally {
-                proxyProcess.close();
+                proxyLease.close();
             }
             if (thrown != null) {
                 throw thrown;
             }
             return null;
+        }
+
+        private Object handleAbort(Object[] args) throws SQLException {
+            if (!closed.compareAndSet(false, true)) {
+                return null;
+            }
+            SQLException thrown = null;
+            try {
+                if (args != null && args.length == 1 && args[0] instanceof Executor) {
+                    delegate.abort((Executor) args[0]);
+                } else {
+                    delegate.close();
+                }
+            } catch (SQLException e) {
+                thrown = e;
+            } finally {
+                proxyLease.close();
+            }
+            if (thrown != null) {
+                throw thrown;
+            }
+            return null;
+        }
+    }
+
+    private static final class ProxyKey {
+        private final String instanceName;
+        private final String binary;
+        private final String args;
+        private final String bindHost;
+        private final int requestedPort;
+
+        private ProxyKey(String instanceName, String binary, String args, String bindHost, int requestedPort) {
+            this.instanceName = instanceName;
+            this.binary = binary;
+            this.args = args;
+            this.bindHost = bindHost;
+            this.requestedPort = requestedPort;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof ProxyKey)) {
+                return false;
+            }
+            ProxyKey other = (ProxyKey) o;
+            return requestedPort == other.requestedPort
+                    && Objects.equals(instanceName, other.instanceName)
+                    && Objects.equals(binary, other.binary)
+                    && Objects.equals(args, other.args)
+                    && Objects.equals(bindHost, other.bindHost);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(instanceName, binary, args, bindHost, requestedPort);
+        }
+    }
+
+    private static final class SharedProxy {
+        private final ProxyKey key;
+        private final ProxyProcess process;
+        private final int port;
+        private int refCount;
+        private boolean closed;
+
+        private SharedProxy(ProxyKey key, ProxyProcess process, int port) {
+            this.key = key;
+            this.process = process;
+            this.port = port;
+        }
+    }
+
+    private static final class ProxyLease {
+        private final SharedProxy shared;
+        private final AtomicBoolean released = new AtomicBoolean(false);
+
+        private ProxyLease(SharedProxy shared) {
+            this.shared = shared;
+        }
+
+        private int getPort() {
+            return shared.port;
+        }
+
+        private void close() {
+            if (!released.compareAndSet(false, true)) {
+                return;
+            }
+            releaseProxy(shared);
         }
     }
 }

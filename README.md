@@ -53,7 +53,7 @@ Common ways to provide ADC:
 
 ## Notes
 
-- The proxy starts **per connection** and stops when the JDBC connection closes.
+- The proxy is **shared** across connections that use the same instance and proxy settings, and it stops when the last connection closes.
 - DBeaver may open multiple connections for metadata and preview queries, so multiple proxy processes may appear.
 - Authentication is handled by `cloud-sql-proxy` (ADC by default).
 - In DBeaver, the safest setup is:
