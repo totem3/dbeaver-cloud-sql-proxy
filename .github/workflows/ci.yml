@@ -27,4 +27,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dbeaver-cloud-sql-proxy-driver
-          path: build/dbeaver-cloud-sql-proxy-driver.jar
+          path: target/dbeaver-cloud-sql-proxy-driver.jar

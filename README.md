@@ -1,22 +1,21 @@
 # DBeaver Cloud SQL Proxy Driver (PostgreSQL)
 
-A small JDBC driver wrapper that starts `cloud-sql-proxy` on a local port and connects PostgreSQL through it. This is useful when you want DBeaver to create the proxy tunnel automatically instead of using the socket factory approach.
+A small JDBC driver wrapper that configures the Cloud SQL JDBC connector (`com.google.cloud.sql.postgres.SocketFactory`) and connects PostgreSQL without launching an external `cloud-sql-proxy` process.
 
-## Build
+## Build (Fat Jar)
 
 ```bash
 ./scripts/build.sh
 ```
 
-This creates `build/dbeaver-cloud-sql-proxy-driver.jar`.
+This creates `target/dbeaver-cloud-sql-proxy-driver.jar` as a fat jar (driver + dependencies, including Cloud SQL Socket Factory).
 
 ## DBeaver Setup
 
 1. Open **Database > Driver Manager** and create a new driver.
 2. Set **Driver Class** to `com.totem3.dbeaver.cloudsqlproxy.CloudSqlProxyDriver`.
-3. Add driver files:
-   - `build/dbeaver-cloud-sql-proxy-driver.jar`
-   - PostgreSQL JDBC driver (download via DBeaver or add your own).
+3. Add driver file:
+   - `target/dbeaver-cloud-sql-proxy-driver.jar`
 4. URL template example (see note below):
 
 ```
@@ -29,22 +28,20 @@ You can also set `instanceConnectionName` in **Driver Properties** instead of th
 
 - `instanceConnectionName` (required)
   - Cloud SQL instance connection name: `project:region:instance`
-- `cloudSqlProxyBinary` (recommended)
-  - Absolute path to `cloud-sql-proxy` (GUI apps often do not inherit your shell PATH)
-- `cloudSqlProxyArgs` (optional)
-  - Extra arguments for the proxy, e.g. `--auto-iam-authn` (ADC is used by default)
-- `cloudSqlProxyPort` (optional)
-  - Local port for the proxy (0 or empty = auto)
-- `cloudSqlProxyHost` (optional)
-  - Bind address for the proxy (default `127.0.0.1`)
-- `cloudSqlProxyReadyTimeoutMs` (optional)
-  - Startup timeout in milliseconds (default `10000`)
+- `cloudSqlIpTypes` (optional)
+  - Connector IP preference, e.g. `PUBLIC,PRIVATE` or `PRIVATE`
+- `cloudSqlEnableIamAuth` (optional)
+  - Enable Cloud SQL IAM DB auth (`true` / `false`)
+- `cloudSqlUnixSocketPath` (optional)
+  - Unix socket base path if your runtime supports unix sockets
+- `cloudSqlRefreshStrategy` (optional)
+  - Connector refresh strategy (default `lazy`)
 - `delegateDriver` (optional)
   - JDBC driver class to delegate to (default `org.postgresql.Driver`)
 
 ## Authentication (ADC)
 
-This driver relies on `cloud-sql-proxy` for authentication. If you do not pass `--credentials-file`, the proxy uses **Application Default Credentials (ADC)**.
+This driver relies on the Cloud SQL JDBC connector for authentication and metadata refresh. By default it uses **Application Default Credentials (ADC)**.
 
 Common ways to provide ADC:
 
@@ -53,19 +50,16 @@ Common ways to provide ADC:
 
 ## Notes
 
-- The proxy is **shared** across connections that use the same instance and proxy settings, and it stops when the last connection closes.
-- DBeaver may open multiple connections for metadata and preview queries, so multiple proxy processes may appear.
-- Authentication is handled by `cloud-sql-proxy` (ADC by default).
-- In DBeaver, the safest setup is:
-  - Set `instanceConnectionName` in **Driver Properties** (URL template variables may not be expanded in some modes).
-  - Set `cloudSqlProxyBinary` to an **absolute path**, because DBeaver's PATH can be minimal.
+- DBeaver may open multiple JDBC connections for metadata/preview queries.
+- Set `instanceConnectionName` in **Driver Properties** (URL template variables may not be expanded in some modes).
 
 ## Example
 
 Driver Properties:
 
 - `instanceConnectionName=my-project:asia-northeast1:my-instance`
-- `cloudSqlProxyArgs=--credentials-file=/Users/me/.config/gcloud/my-sa.json`
+- `cloudSqlEnableIamAuth=true`
+- `cloudSqlIpTypes=PRIVATE`
 
 URL:
 

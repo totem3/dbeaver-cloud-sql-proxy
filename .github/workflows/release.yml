@@ -23,4 +23,4 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/dbeaver-cloud-sql-proxy-driver.jar
+          files: target/dbeaver-cloud-sql-proxy-driver.jar

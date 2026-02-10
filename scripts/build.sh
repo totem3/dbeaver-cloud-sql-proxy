@@ -2,23 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BUILD_DIR="$ROOT_DIR/build"
-CLASSES_DIR="$BUILD_DIR/classes"
-SRC_DIR="$ROOT_DIR/src/main/java"
-RES_DIR="$ROOT_DIR/src/main/resources"
-JAR_NAME="dbeaver-cloud-sql-proxy-driver.jar"
-JAR_PATH="$BUILD_DIR/$JAR_NAME"
+OUTPUT_JAR="$ROOT_DIR/target/dbeaver-cloud-sql-proxy-driver.jar"
 
-mkdir -p "$CLASSES_DIR"
-
-find "$SRC_DIR" -name "*.java" > "$BUILD_DIR/sources.txt"
-
-javac -source 1.8 -target 1.8 -d "$CLASSES_DIR" @"$BUILD_DIR/sources.txt"
-
-if [ -d "$RES_DIR" ]; then
-  cp -R "$RES_DIR"/. "$CLASSES_DIR"/
+if ! command -v mvn >/dev/null 2>&1; then
+  echo "Error: mvn command not found. Install Maven first." >&2
+  echo "Then rerun: ./scripts/build.sh" >&2
+  exit 1
 fi
 
-jar cf "$JAR_PATH" -C "$CLASSES_DIR" .
+cd "$ROOT_DIR"
 
-echo "Built $JAR_PATH"
+mvn -q -DskipTests clean package
+
+echo "Built fat jar: $OUTPUT_JAR"
