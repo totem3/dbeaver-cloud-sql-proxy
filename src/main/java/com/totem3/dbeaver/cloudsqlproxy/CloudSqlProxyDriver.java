@@ -1,6 +1,8 @@
 package com.totem3.dbeaver.cloudsqlproxy;
 
+import com.google.cloud.sql.ConnectorRegistry;
 import java.io.UnsupportedEncodingException;
+import java.io.File;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -15,6 +17,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -31,7 +34,15 @@ public final class CloudSqlProxyDriver implements Driver {
     private static final String PROP_ENABLE_IAM_AUTH = "cloudSqlEnableIamAuth";
     private static final String PROP_UNIX_SOCKET_PATH = "cloudSqlUnixSocketPath";
     private static final String PROP_REFRESH_STRATEGY = "cloudSqlRefreshStrategy";
+    private static final String PROP_GOOGLE_CREDENTIALS_PATH = "cloudSqlGoogleCredentialsPath";
     private static final String PROP_DELEGATE_DRIVER = "delegateDriver";
+
+    private static final String ENV_GOOGLE_APPLICATION_CREDENTIALS = "GOOGLE_APPLICATION_CREDENTIALS";
+    private static final String ENV_CLOUDSDK_CONFIG = "CLOUDSDK_CONFIG";
+    private static final String ENV_HOME = "HOME";
+    private static final String ENV_APPDATA = "APPDATA";
+    private static final String ENV_LOCALAPPDATA = "LOCALAPPDATA";
+    private static final String ADC_FILE_NAME = "application_default_credentials.json";
 
     // Legacy properties from process-based implementation. These are ignored.
     private static final String PROP_PROXY_BINARY = "cloudSqlProxyBinary";
@@ -51,6 +62,7 @@ public final class CloudSqlProxyDriver implements Driver {
             PROP_ENABLE_IAM_AUTH,
             PROP_UNIX_SOCKET_PATH,
             PROP_REFRESH_STRATEGY,
+            PROP_GOOGLE_CREDENTIALS_PATH,
             PROP_DELEGATE_DRIVER,
             PROP_PROXY_BINARY,
             PROP_PROXY_ARGS,
@@ -73,14 +85,34 @@ public final class CloudSqlProxyDriver implements Driver {
             return null;
         }
 
+        ParsedUrl parsed = parseUrl(url);
+        try {
+            return connectOnce(parsed, info);
+        } catch (SQLException firstFailure) {
+            if (!shouldRetryWithFreshCredentials(firstFailure)) {
+                throw firstFailure;
+            }
+
+            logger.warning("Authentication-related Cloud SQL connection failure detected; resetting connector registry and retrying once: "
+                    + summarizeThrowable(firstFailure));
+            ConnectorRegistry.reset();
+
+            try {
+                return connectOnce(parsed, info);
+            } catch (SQLException retryFailure) {
+                retryFailure.addSuppressed(firstFailure);
+                throw retryFailure;
+            }
+        }
+    }
+
+    private Connection connectOnce(ParsedUrl parsed, Properties info) throws SQLException {
         Properties delegateProps = new Properties();
         if (info != null) {
             for (Map.Entry<Object, Object> entry : info.entrySet()) {
                 delegateProps.put(entry.getKey(), entry.getValue());
             }
         }
-
-        ParsedUrl parsed = parseUrl(url);
 
         String instanceConnectionName = extractConfigValue(PROP_INSTANCE_CONNECTION_NAME, delegateProps, parsed.queryParams);
         if (isBlank(instanceConnectionName)) {
@@ -99,6 +131,10 @@ public final class CloudSqlProxyDriver implements Driver {
                 extractConfigValue(PROP_REFRESH_STRATEGY, delegateProps, parsed.queryParams),
                 DEFAULT_REFRESH_STRATEGY
         );
+        String googleCredentialsPath = extractConfigValue(PROP_GOOGLE_CREDENTIALS_PATH, delegateProps, parsed.queryParams);
+        if (isBlank(googleCredentialsPath)) {
+            googleCredentialsPath = resolveDefaultAdcCredentialsPath();
+        }
 
         // Drop legacy process-based keys from delegate props if they were supplied.
         extractConfigValue(PROP_PROXY_BINARY, delegateProps, parsed.queryParams);
@@ -128,6 +164,9 @@ public final class CloudSqlProxyDriver implements Driver {
         if (!isBlank(enableIamAuth)) {
             delegateProps.setProperty("enableIamAuth", enableIamAuth);
         }
+        if (!isBlank(googleCredentialsPath)) {
+            delegateProps.setProperty(PROP_GOOGLE_CREDENTIALS_PATH, googleCredentialsPath);
+        }
         if (!isBlank(unixSocketPath)) {
             delegateProps.setProperty("unixSocketPath", unixSocketPath);
         }
@@ -152,6 +191,7 @@ public final class CloudSqlProxyDriver implements Driver {
         props.add(propertyInfo(PROP_ENABLE_IAM_AUTH, "Enable IAM DB auth (true/false)", false));
         props.add(propertyInfo(PROP_UNIX_SOCKET_PATH, "Optional unix socket path for environments with unix socket support", false));
         props.add(propertyInfo(PROP_REFRESH_STRATEGY, "Cloud SQL connector refresh strategy (default lazy)", false));
+        props.add(propertyInfo(PROP_GOOGLE_CREDENTIALS_PATH, "Cloud SQL connector credential file path (defaults to ADC resolution)", false));
         props.add(propertyInfo(PROP_DELEGATE_DRIVER, "Delegate JDBC driver class (default org.postgresql.Driver)", false));
         return props.toArray(new DriverPropertyInfo[0]);
     }
@@ -285,6 +325,110 @@ public final class CloudSqlProxyDriver implements Driver {
             }
         }
         return value;
+    }
+
+    private static String resolveDefaultAdcCredentialsPath() {
+        String explicit = getEnvironmentValue(ENV_GOOGLE_APPLICATION_CREDENTIALS);
+        if (!isBlank(explicit) && isExistingFile(explicit)) {
+            return explicit;
+        }
+        if (!isBlank(explicit)) {
+            return null;
+        }
+
+        String cloudSdkConfig = getEnvironmentValue(ENV_CLOUDSDK_CONFIG);
+        String byCloudSdk = resolveAdcPathFromConfigDir(cloudSdkConfig);
+        if (!isBlank(byCloudSdk) && isExistingFile(byCloudSdk)) {
+            return byCloudSdk;
+        }
+
+        String home = getEnvironmentValue(ENV_HOME);
+        if (!isBlank(home)) {
+            String byHome = resolveAdcPathFromConfigDir(buildPath(home, ".config", "gcloud"));
+            if (!isBlank(byHome) && isExistingFile(byHome)) {
+                return byHome;
+            }
+        }
+
+        String appData = firstNonBlank(
+                getEnvironmentValue(ENV_APPDATA),
+                getEnvironmentValue(ENV_LOCALAPPDATA)
+        );
+        if (!isBlank(appData)) {
+            String byAppData = resolveAdcPathFromConfigDir(buildPath(appData, "gcloud"));
+            if (!isBlank(byAppData) && isExistingFile(byAppData)) {
+                return byAppData;
+            }
+        }
+        return null;
+    }
+
+    private static String buildPath(String baseDir, String... segments) {
+        File path = new File(baseDir);
+        for (String segment : segments) {
+            path = new File(path, segment);
+        }
+        return path.getPath();
+    }
+
+    private static String resolveAdcPathFromConfigDir(String baseDir) {
+        if (isBlank(baseDir)) {
+            return null;
+        }
+        return new File(baseDir, ADC_FILE_NAME).getPath();
+    }
+
+    private static boolean isExistingFile(String path) {
+        return new File(path).isFile();
+    }
+
+    private static String getEnvironmentValue(String key) {
+        String value = System.getenv(key);
+        return stringValue(value);
+    }
+
+    private static boolean shouldRetryWithFreshCredentials(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (isAuthenticationFailure(current)) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isAuthenticationFailure(Throwable throwable) {
+        String className = throwable.getClass().getName().toLowerCase(Locale.ROOT);
+        if (className.contains("credential") || className.contains("auth")) {
+            return true;
+        }
+
+        String message = throwable.getMessage();
+        if (isBlank(message)) {
+            return false;
+        }
+
+        String normalized = message.toLowerCase(Locale.ROOT);
+        return normalized.contains("application default credentials")
+                || normalized.contains("unable to obtain credentials")
+                || normalized.contains("unable to load googlecredentials")
+                || normalized.contains("credential")
+                || normalized.contains("access token")
+                || normalized.contains("refresh token")
+                || normalized.contains("invalid_grant")
+                || normalized.contains("reauth")
+                || normalized.contains("oauth")
+                || normalized.contains("unauthenticated")
+                || normalized.contains("authentication");
+    }
+
+    private static String summarizeThrowable(Throwable throwable) {
+        String message = throwable.getMessage();
+        if (!isBlank(message)) {
+            return message;
+        }
+        return throwable.getClass().getName();
     }
 
     private static String firstNonBlank(String... values) {

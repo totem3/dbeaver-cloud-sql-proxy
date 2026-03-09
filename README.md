@@ -36,6 +36,11 @@ You can also set `instanceConnectionName` in **Driver Properties** instead of th
   - Unix socket base path if your runtime supports unix sockets
 - `cloudSqlRefreshStrategy` (optional)
   - Connector refresh strategy (default `lazy`)
+- `cloudSqlGoogleCredentialsPath` (optional)
+  - Cloud SQL connector credential file path (defaults to ADC resolution)
+  - This property is automatically resolved from environment defaults on every connection attempt.
+  - If an authentication-related connector error occurs, the driver resets the Cloud SQL connector registry, re-resolves ADC, and retries once.
+  - If you switch ADC credentials (re-login) without restarting DBeaver, this explicit path helps the connector re-read updated credentials consistently.
 - `delegateDriver` (optional)
   - JDBC driver class to delegate to (default `org.postgresql.Driver`)
 
